@@ -9,9 +9,10 @@ mkdir -p /etc/zabbix/zabbix_agentd.d/
 echo ""
 echo "--- Setting up Exim and Yum UserParameters ---"
 
-# Create userparameter_yum.conf
+# Create userparameter_yum.conf with updated parameter names
 cat << 'EOF' > /etc/zabbix/zabbix_agentd.d/userparameter_yum.conf
-UserParameter=yum.updates,cat /tmp/all-updates.txt 2>/dev/null || echo 0
+UserParameter=yum1.security,cat /tmp/security-updates.txt
+UserParameter=yum1.all,cat /tmp/all-updates.txt
 EOF
 
 # Create userparameter_exim.conf
@@ -25,6 +26,8 @@ echo "Adding Cronjobs for Yum and Exim..."
 
 echo "Initializing data files for Yum and Exim..."
 yum list updates 2>/dev/null | grep '\.x86_64\|\.i686' | wc -l > /tmp/all-updates.txt
+touch /tmp/security-updates.txt
+
 if [ -x /usr/sbin/exim ]; then
     /usr/sbin/exim -bpc > /tmp/eximcounttest.txt
 else
@@ -44,7 +47,6 @@ rm -rf /etc/zabbix/zabbix_agentd.d/userparameter_mysql.conf*
 if [ -f /etc/zabbix/.my.cnf ]; then
     cp /etc/zabbix/.my.cnf /etc/zabbix/.my.cnf_old
 fi
-echo > /etc/zabbix/.my.cnf
 
 # Generate random password
 zpassword=$(date +%s | sha256sum | base64 | head -c 12 ; echo)
@@ -73,11 +75,24 @@ EOF
 chmod 600 /etc/zabbix/.my.cnf
 chown zabbix:zabbix /etc/zabbix/.my.cnf 2>/dev/null || true
 
-# Write MySQL UserParameters
+# Write exact Zabbix 4.2 MySQL UserParameters
 cat << 'EOF' > /etc/zabbix/zabbix_agentd.d/template_db_mysql.conf
-UserParameter=mysql.ping,mysqladmin --defaults-extra-file=/etc/zabbix/.my.cnf ping | grep -c alive
-UserParameter=mysql.version,mysql -V
-UserParameter=mysql.status[*],echo "show global status like '$1';" | mysql --defaults-extra-file=/etc/zabbix/.my.cnf -N | awk '{print $$2}'
+#template_db_mysql.conf created by Zabbix for "Template DB MySQL" and Zabbix 4.2
+#For OS Linux: You need create .my.cnf in zabbix-agent home directory (/var/lib/zabbix by default)
+#For OS Windows: You need add PATH to mysql and mysqladmin and create my.cnf in %WINDIR%\my.cnf,C:\my.cnf,BASEDIR\my.cnf https://dev.mysql.com/doc/refman/5.7/en/option-files.html
+#The file must have three strings:
+#[client]
+#user=zbx_monitor
+#password=<password>
+#
+#Default below
+UserParameter=mysql.ping[*],HOME=/etc/zabbix mysqladmin -h"$1" -P"$2" ping
+UserParameter=mysql.get_status_variables[*],HOME=/etc/zabbix mysql -h"$1" -P"$2" -sNX -e "show global status"
+UserParameter=mysql.version[*],HOME=/etc/zabbix mysqladmin -s -h"$1" -P"$2" version
+UserParameter=mysql.db.discovery[*],HOME=/etc/zabbix mysql -h"$1" -P"$2" -sN -e "show databases"
+UserParameter=mysql.dbsize[*],HOME=/etc/zabbix mysql -h"$1" -P"$2" -sN -e "SELECT SUM(DATA_LENGTH + INDEX_LENGTH) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='$3'"
+UserParameter=mysql.replication.discovery[*],HOME=/etc/zabbix mysql -h"$1" -P"$2" -sNX -e "show slave status"
+UserParameter=mysql.slave_status[*],HOME=/etc/zabbix mysql -h"$1" -P"$2" -sNX -e "show slave status"
 EOF
 
 # ==============================================================================
