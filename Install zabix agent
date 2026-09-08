@@ -1,0 +1,114 @@
+#!/bin/bash
+#
+# install-zabbix-agent.sh
+# Detects the Linux distro and installs Zabbix Agent (via official Zabbix repo)
+#
+# Usage:
+#   sudo ./install-zabbix-agent.sh
+#
+# You can override defaults via environment variables, e.g.:
+#   ZABBIX_VERSION=7.4 ZABBIX_SERVER_IP=10.0.0.5 sudo -E ./install-zabbix-agent.sh
+
+set -e
+
+# ---------- CONFIG (edit these) ----------
+ZABBIX_VERSION="${ZABBIX_VERSION:-7.4}"          # Zabbix major.minor version
+ZABBIX_SERVER_IP="${ZABBIX_SERVER_IP:-127.0.0.1}" # IP/hostname of your Zabbix server
+ZABBIX_HOSTNAME="${ZABBIX_HOSTNAME:-$(hostname)}" # Hostname registered in Zabbix
+# ------------------------------------------
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run this script as root (use sudo)."
+    exit 1
+fi
+
+echo "=== Detecting OS ==="
+if [ -f /etc/os-release ]; then
+    . /etc/os-release
+    OS_ID="$ID"
+    OS_VERSION="$VERSION_ID"
+else
+    echo "Cannot detect OS (missing /etc/os-release). Aborting."
+    exit 1
+fi
+
+echo "Detected: $OS_ID $OS_VERSION"
+
+install_debian_ubuntu() {
+    local codename
+    codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+
+    echo "=== Installing Zabbix repo for $OS_ID $OS_VERSION ($codename) ==="
+    apt-get update -y
+    apt-get install -y wget gnupg
+
+    REPO_DEB="zabbix-release_latest_${ZABBIX_VERSION}+${OS_ID}${OS_VERSION}_all.deb"
+    REPO_URL="https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/${OS_ID}/pool/main/z/zabbix-release/${REPO_DEB}"
+
+    wget -q "$REPO_URL" -O /tmp/zabbix-release.deb || {
+        echo "Could not fetch $REPO_URL"
+        echo "Check available versions at https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/${OS_ID}/pool/main/z/zabbix-release/"
+        exit 1
+    }
+
+    dpkg -i /tmp/zabbix-release.deb
+    apt-get update -y
+    apt-get install -y zabbix-agent
+}
+
+install_rhel_family() {
+    local rhel_ver="${OS_VERSION%%.*}"
+
+    echo "=== Installing Zabbix repo for $OS_ID $rhel_ver ==="
+    rpm -Uvh "https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/rhel/${rhel_ver}/x86_64/zabbix-release-latest-${ZABBIX_VERSION}.el${rhel_ver}.noarch.rpm" || {
+        echo "Could not fetch Zabbix repo RPM. Check https://www.zabbix.com/download for the correct URL for your OS."
+        exit 1
+    }
+
+    if command -v dnf >/dev/null 2>&1; then
+        dnf clean all
+        dnf install -y zabbix-agent
+    else
+        yum clean all
+        yum install -y zabbix-agent
+    fi
+}
+
+case "$OS_ID" in
+    ubuntu|debian)
+        install_debian_ubuntu
+        ;;
+    rhel|centos|almalinux|rocky|fedora)
+        install_rhel_family
+        ;;
+    *)
+        echo "Unsupported or unrecognized OS: $OS_ID"
+        echo "See https://www.zabbix.com/download for manual install instructions."
+        exit 1
+        ;;
+esac
+
+echo "=== Configuring Zabbix Agent ==="
+CONF_FILE="/etc/zabbix/zabbix_agentd.conf"
+
+if [ -f "$CONF_FILE" ]; then
+    cp "$CONF_FILE" "${CONF_FILE}.bak.$(date +%s)"
+    sed -i "s/^Server=.*/Server=${ZABBIX_SERVER_IP}/" "$CONF_FILE"
+    sed -i "s/^ServerActive=.*/ServerActive=${ZABBIX_SERVER_IP}/" "$CONF_FILE"
+    sed -i "s/^Hostname=.*/Hostname=${ZABBIX_HOSTNAME}/" "$CONF_FILE"
+    echo "Updated $CONF_FILE (backup saved alongside it)."
+else
+    echo "Warning: $CONF_FILE not found. Skipping config update."
+fi
+
+echo "=== Enabling and starting zabbix-agent ==="
+systemctl enable zabbix-agent
+systemctl restart zabbix-agent
+systemctl status zabbix-agent --no-pager
+
+echo ""
+echo "=== Done ==="
+echo "Zabbix Agent installed and running."
+echo "Server:   $ZABBIX_SERVER_IP"
+echo "Hostname: $ZABBIX_HOSTNAME"
+echo "Make sure this host is added in the Zabbix web UI with a matching hostname."
