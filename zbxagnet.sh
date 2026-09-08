@@ -1,12 +1,12 @@
 #!/bin/bash
 #
 # zabbix-setup-menu.sh
-# Interactive Setup Script for Zabbix Agent (Version 7.4)
+# Interactive Setup Script for Zabbix Agent 1 & Monitoring Parameters
 #
 set -euo pipefail
 
 # ---------- GLOBAL CONFIG ----------
-ZABBIX_VERSION="7.4"
+ZABBIX_VERSION="${ZABBIX_VERSION:-7.0}"
 ZABBIX_SERVER_IP="${ZABBIX_SERVER_IP:-monitoring.leapswitch.com}"
 ZABBIX_LISTEN_PORT="${ZABBIX_LISTEN_PORT:-10050}"
 
@@ -21,7 +21,12 @@ ZABBIX_HOSTNAME="${ZABBIX_HOSTNAME:-${SYS_HOSTNAME}-${LAST_OCTET}}"
 log()  { echo -e "[$(date +'%H:%M:%S')] $*"; }
 fail() { echo -e "[$(date +'%H:%M:%S')] ERROR: $*" >&2; exit 1; }
 
+# Ensure script is run as root
 [ "$EUID" -eq 0 ] || fail "Please run as root (e.g., sudo ./zabbix-setup-menu.sh)."
+
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
 
 configure_base_agent() {
     log "Configuring /etc/zabbix/zabbix_agentd.conf..."
@@ -45,13 +50,10 @@ configure_base_agent() {
     systemctl restart zabbix-agent
 }
 
+# Option 1 Routine: Ubuntu / Debian Installation
 install_ubuntu() {
-    log "=== Installing Zabbix Agent ${ZABBIX_VERSION} on Ubuntu / Debian ==="
+    log "=== Starting Ubuntu / Debian Zabbix Agent Installation ==="
     export DEBIAN_FRONTEND=noninteractive
-    
-    # Remove older zabbix repository release package if present
-    dpkg -P zabbix-release 2>/dev/null || true
-
     apt-get update -y
     apt-get install -y wget gnupg lsb-release ca-certificates
 
@@ -66,59 +68,60 @@ install_ubuntu() {
     if ! wget -q "$repo_url" -O /tmp/zabbix-release.deb; then
         repo_deb="zabbix-release_latest_${ZABBIX_VERSION}+${OS_ID}${codename}_all.deb"
         repo_url="https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/${OS_ID}/pool/main/z/zabbix-release/${repo_deb}"
-        wget -q "$repo_url" -O /tmp/zabbix-release.deb || fail "Could not fetch Zabbix 7.4 repository package."
+        wget -q "$repo_url" -O /tmp/zabbix-release.deb || fail "Could not fetch Zabbix repository package for Ubuntu/Debian."
     fi
 
     dpkg -i /tmp/zabbix-release.deb
     apt-get update -y
-    apt-get install -y --allow-downgrades zabbix-agent
+    apt-get install -y zabbix-agent
 
     configure_base_agent
-    
-    # Verify version after installation
-    zabbix_agentd -V | head -n 1
+    log "Ubuntu/Debian Zabbix Agent installation completed successfully!"
 }
 
+# Option 2 Routine: RedHat / Fedora / AlmaLinux / Rocky Installation
 install_redhat() {
-    log "=== Installing Zabbix Agent ${ZABBIX_VERSION} on RedHat / Fedora / AlmaLinux / Rocky ==="
+    log "=== Starting RedHat / Fedora / AlmaLinux Installation ==="
     local rhel_ver pkg_mgr="yum"
     rhel_ver=$(. /etc/os-release && echo "${VERSION_ID%%.*}")
     [ -z "$rhel_ver" ] && rhel_ver="8"
     command -v dnf >/dev/null 2>&1 && pkg_mgr="dnf"
 
-    rpm -e zabbix-release 2>/dev/null || true
-
     rpm -Uvh --replacepkgs \
         "https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/rhel/${rhel_ver}/x86_64/zabbix-release-latest-${ZABBIX_VERSION}.el${rhel_ver}.noarch.rpm" \
-        || fail "Could not fetch Zabbix 7.4 repository RPM."
+        || fail "Could not fetch Zabbix repository RPM."
 
     $pkg_mgr clean all
     $pkg_mgr install -y zabbix-agent
 
     configure_base_agent
-    
-    # Verify version after installation
-    zabbix_agentd -V | head -n 1
+    log "RedHat/Fedora/AlmaLinux Zabbix Agent installation completed successfully!"
 }
 
+# Option 3 Routine: Custom User Parameters (Yum, Exim, MySQL)
 install_user_parameters() {
     log "=== Adding Additional UserParameters (Yum, Exim, MySQL) ==="
 
     mkdir -p /etc/zabbix/zabbix_agentd.d/
 
+    # 1. Package/Yum Updates UserParameter
     cat << 'EOF' > /etc/zabbix/zabbix_agentd.d/userparameter_yum.conf
 UserParameter=yum1.security,cat /tmp/security-updates.txt 2>/dev/null || echo 0
 UserParameter=yum1.all,cat /tmp/all-updates.txt 2>/dev/null || echo 0
 EOF
 
+    # 2. Exim Queue UserParameter
     cat << 'EOF' > /etc/zabbix/zabbix_agentd.d/userparameter_exim.conf
 UserParameter=exim.queue,cat /tmp/eximcounttest.txt 2>/dev/null || echo 0
 EOF
 
+    # Setup Cron Jobs for Yum & Exim data generation
+    log "Setting up cron jobs..."
     (crontab -l 2>/dev/null | grep -v 'all-updates.txt' | grep -v 'eximcounttest.txt' || true; \
      echo "0 1 * * * yum list updates 2>/dev/null | grep -E '\.x86_64|\.i686|\.noarch' | wc -l > /tmp/all-updates.txt"; \
      echo "*/5 * * * * /usr/sbin/exim -bpc > /tmp/eximcounttest.txt 2>/dev/null || echo 0 > /tmp/eximcounttest.txt") | crontab -
 
+    # Populate cache files
     touch /tmp/security-updates.txt
     if command -v yum >/dev/null 2>&1; then
         yum list updates 2>/dev/null | grep -E '\.x86_64|\.i686|\.noarch' | wc -l > /tmp/all-updates.txt || echo "0" > /tmp/all-updates.txt
@@ -135,6 +138,7 @@ EOF
     fi
     chmod 644 /tmp/all-updates.txt /tmp/security-updates.txt /tmp/eximcounttest.txt
 
+    # 3. MySQL UserParameters & User Provisioning
     log "Setting up MySQL/MariaDB monitoring parameters..."
     zpassword=$(date +%s | sha256sum | base64 | head -c 12 ; echo)
 
@@ -176,14 +180,14 @@ EOF
 }
 
 # ==============================================================================
-# MAIN MENU
+# MAIN INTERACTIVE MENU
 # ==============================================================================
 clear
 echo "================================================="
-echo "     ZABBIX AGENT SETUP MENU (Version 7.4)       "
+echo "        ZABBIX AGENT SETUP MENU                  "
 echo "================================================="
-echo "1) Install Zabbix Agent 7.4 for Ubuntu / Debian"
-echo "2) Install Zabbix Agent 7.4 for RedHat / Fedora / AlmaLinux / Rocky"
+echo "1) Install Zabbix Agent for Ubuntu / Debian"
+echo "2) Install Zabbix Agent for RedHat / Fedora / AlmaLinux / Rocky"
 echo "3) Configure Additional User Parameters (Yum, Exim, MySQL)"
 echo "4) Exit"
 echo "================================================="
