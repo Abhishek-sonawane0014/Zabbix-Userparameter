@@ -1,0 +1,1099 @@
+#!/bin/bash
+#
+# zabbix-setup-menu.sh
+#
+# Zabbix 7.4 Unified Installation & Configuration Script
+#
+# Options:
+#   1. Install Zabbix Agent (Classic)
+#   2. Install Zabbix Agent 2
+#   3. Configure Additional UserParameters
+#   4. Exit
+#
+# Supported OS:
+#   - Ubuntu
+#   - Debian
+#   - RHEL
+#   - Rocky Linux
+#   - AlmaLinux
+#   - CentOS
+#
+# Zabbix Server:
+#   monitoring.leapswitch.com
+#   134.209.94.33
+#
+# Hostname:
+#   Automatically detected Server IP
+#
+
+set -euo pipefail
+
+# ==========================================================
+# GLOBAL CONFIGURATION
+# ==========================================================
+
+ZABBIX_VERSION="${ZABBIX_VERSION:-7.4}"
+ZABBIX_SERVER="${ZABBIX_SERVER:-monitoring.leapswitch.com}"
+ZABBIX_SERVER_IP="${ZABBIX_SERVER_IP:-134.209.94.33}"
+ZABBIX_LISTEN_PORT="${ZABBIX_LISTEN_PORT:-10050}"
+
+# ==========================================================
+# COLORS / LOGGING
+# ==========================================================
+
+log() {
+    echo -e "[$(date +'%H:%M:%S')] $*"
+}
+
+fail() {
+    echo -e "[$(date +'%H:%M:%S')] ERROR: $*" >&2
+    exit 1
+}
+
+# ==========================================================
+# ROOT CHECK
+# ==========================================================
+
+if [ "$EUID" -ne 0 ]; then
+    fail "Please run this script as root."
+fi
+
+# ==========================================================
+# OS DETECTION
+# ==========================================================
+
+if [ ! -f /etc/os-release ]; then
+    fail "Cannot detect operating system."
+fi
+
+source /etc/os-release
+
+OS_ID="${ID:-unknown}"
+OS_VERSION="${VERSION_ID:-unknown}"
+
+echo ""
+echo "======================================================"
+echo "              SYSTEM INFORMATION"
+echo "======================================================"
+echo "OS           : ${NAME:-Unknown}"
+echo "Version      : ${OS_VERSION}"
+echo "Zabbix       : ${ZABBIX_VERSION}"
+echo "Zabbix Server: ${ZABBIX_SERVER}"
+echo "Server IP    : ${ZABBIX_SERVER_IP}"
+echo "======================================================"
+echo ""
+
+# ==========================================================
+# SERVER IP DETECTION
+# ==========================================================
+
+detect_server_ip() {
+
+    local detected_ip=""
+
+    detected_ip=$(ip route get 8.8.8.8 2>/dev/null | \
+        awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+
+    if [ -z "$detected_ip" ]; then
+        detected_ip=$(ip route get 1.1.1.1 2>/dev/null | \
+            awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}')
+    fi
+
+    if [ -z "$detected_ip" ]; then
+        detected_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    fi
+
+    if [ -z "$detected_ip" ]; then
+        fail "Unable to detect server IP address."
+    fi
+
+    echo "$detected_ip"
+}
+
+SERVER_IP=$(detect_server_ip)
+
+echo "Detected Server IP : ${SERVER_IP}"
+echo "Zabbix Hostname    : ${SERVER_IP}"
+echo ""
+
+# ==========================================================
+# PACKAGE MANAGER
+# ==========================================================
+
+install_common_packages() {
+
+    case "$OS_ID" in
+
+        ubuntu|debian)
+
+            export DEBIAN_FRONTEND=noninteractive
+
+            apt-get update -y
+            apt-get install -y \
+                wget \
+                curl \
+                ca-certificates \
+                gnupg \
+                lsb-release \
+                cron \
+                iproute2 \
+                iputils-ping \
+                net-tools \
+                procps \
+                openssh-client
+
+            ;;
+
+        rhel|rocky|almalinux|centos|fedora)
+
+            if command -v dnf >/dev/null 2>&1; then
+                dnf install -y \
+                    wget \
+                    curl \
+                    ca-certificates \
+                    cronie \
+                    iproute \
+                    iputils \
+                    net-tools \
+                    procps-ng \
+                    openssh-clients
+            else
+                yum install -y \
+                    wget \
+                    curl \
+                    ca-certificates \
+                    cronie \
+                    iproute \
+                    iputils \
+                    net-tools \
+                    procps-ng \
+                    openssh-clients
+            fi
+
+            ;;
+
+        *)
+            fail "Unsupported operating system: ${OS_ID}"
+            ;;
+    esac
+}
+
+# ==========================================================
+# INSTALL ZABBIX REPOSITORY
+# ==========================================================
+
+install_zabbix_repo() {
+
+    log "Installing Zabbix ${ZABBIX_VERSION} repository..."
+
+    case "$OS_ID" in
+
+        rhel|rocky|almalinux|centos|fedora)
+
+            local rhel_version
+
+            if command -v rpm >/dev/null 2>&1; then
+                rhel_version=$(rpm -E %{rhel} 2>/dev/null || true)
+            fi
+
+            if [ -z "$rhel_version" ]; then
+                rhel_version="${VERSION_ID%%.*}"
+            fi
+
+            case "$rhel_version" in
+                7|8|9|10)
+                    ;;
+                *)
+                    fail "Unsupported RHEL version: ${rhel_version}"
+                    ;;
+            esac
+
+            log "Detected RHEL major version: ${rhel_version}"
+
+            if command -v dnf >/dev/null 2>&1; then
+
+                dnf install -y \
+                    "https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/release/rhel/${rhel_version}/noarch/zabbix-release-latest-${ZABBIX_VERSION}.el${rhel_version}.noarch.rpm"
+
+                dnf clean all
+
+            else
+
+                yum install -y \
+                    "https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/release/rhel/${rhel_version}/noarch/zabbix-release-latest-${ZABBIX_VERSION}.el${rhel_version}.noarch.rpm"
+
+                yum clean all
+
+            fi
+
+            ;;
+
+        ubuntu)
+
+            apt-get update -y
+            apt-get install -y wget
+
+            case "$VERSION_ID" in
+
+                24.04)
+
+                    wget -q \
+                    "https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/release/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest_${ZABBIX_VERSION}+ubuntu24.04_all.deb" \
+                    -O /tmp/zabbix-release.deb
+
+                    ;;
+
+                22.04)
+
+                    wget -q \
+                    "https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/release/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest_${ZABBIX_VERSION}+ubuntu22.04_all.deb" \
+                    -O /tmp/zabbix-release.deb
+
+                    ;;
+
+                *)
+
+                    fail "Unsupported Ubuntu version: ${VERSION_ID}"
+
+                    ;;
+            esac
+
+            dpkg -i /tmp/zabbix-release.deb
+            apt-get update -y
+
+            ;;
+
+        debian)
+
+            apt-get update -y
+            apt-get install -y wget
+
+            case "$VERSION_ID" in
+
+                12)
+
+                    wget -q \
+                    "https://repo.zabbix.com/zabbix/${ZABBIX_VERSION}/release/debian/pool/main/z/zabbix-release/zabbix-release_latest_${ZABBIX_VERSION}+debian12_all.deb" \
+                    -O /tmp/zabbix-release.deb
+
+                    ;;
+
+                *)
+
+                    fail "Unsupported Debian version: ${VERSION_ID}"
+
+                    ;;
+            esac
+
+            dpkg -i /tmp/zabbix-release.deb
+            apt-get update -y
+
+            ;;
+
+        *)
+
+            fail "Unsupported operating system: ${OS_ID}"
+
+            ;;
+    esac
+
+    log "Zabbix repository installed successfully."
+
+}
+
+# ==========================================================
+# REMOVE EXISTING ZABBIX AGENTS
+# ==========================================================
+
+remove_existing_agents() {
+
+    log "Checking for existing Zabbix agents..."
+
+    case "$OS_ID" in
+
+        rhel|rocky|almalinux|centos|fedora)
+
+            if rpm -q zabbix-agent >/dev/null 2>&1; then
+
+                log "Removing existing Zabbix Agent (Classic)..."
+
+                if command -v dnf >/dev/null 2>&1; then
+                    dnf remove -y zabbix-agent
+                else
+                    yum remove -y zabbix-agent
+                fi
+
+            fi
+
+            if rpm -q zabbix-agent2 >/dev/null 2>&1; then
+
+                log "Removing existing Zabbix Agent 2..."
+
+                if command -v dnf >/dev/null 2>&1; then
+                    dnf remove -y zabbix-agent2
+                else
+                    yum remove -y zabbix-agent2
+                fi
+
+            fi
+
+            ;;
+
+        ubuntu|debian)
+
+            if dpkg -s zabbix-agent >/dev/null 2>&1; then
+
+                log "Removing existing Zabbix Agent (Classic)..."
+
+                apt-get remove -y zabbix-agent
+
+            fi
+
+            if dpkg -s zabbix-agent2 >/dev/null 2>&1; then
+
+                log "Removing existing Zabbix Agent 2..."
+
+                apt-get remove -y zabbix-agent2
+
+            fi
+
+            ;;
+
+    esac
+
+}
+
+# ==========================================================
+# INSTALL SELECTED AGENT
+# ==========================================================
+
+install_selected_agent() {
+
+    local agent_type="$1"
+
+    case "$agent_type" in
+
+        classic)
+
+            log "Installing Zabbix Agent (Classic)..."
+
+            case "$OS_ID" in
+
+                rhel|rocky|almalinux|centos|fedora)
+
+                    if command -v dnf >/dev/null 2>&1; then
+                        dnf install -y zabbix-agent
+                    else
+                        yum install -y zabbix-agent
+                    fi
+
+                    ;;
+
+                ubuntu|debian)
+
+                    apt-get install -y zabbix-agent
+
+                    ;;
+
+            esac
+
+            CONFIG="/etc/zabbix/zabbix_agentd.conf"
+            SERVICE="zabbix-agent"
+            BINARY="zabbix_agentd"
+
+            ;;
+
+        agent2)
+
+            log "Installing Zabbix Agent 2..."
+
+            case "$OS_ID" in
+
+                rhel|rocky|almalinux|centos|fedora)
+
+                    if command -v dnf >/dev/null 2>&1; then
+                        dnf install -y zabbix-agent2
+                    else
+                        yum install -y zabbix-agent2
+                    fi
+
+                    ;;
+
+                ubuntu|debian)
+
+                    apt-get install -y zabbix-agent2
+
+                    ;;
+
+            esac
+
+            CONFIG="/etc/zabbix/zabbix_agent2.conf"
+            SERVICE="zabbix-agent2"
+            BINARY="zabbix_agent2"
+
+            ;;
+
+        *)
+
+            fail "Invalid agent type."
+
+            ;;
+
+    esac
+
+}
+
+# ==========================================================
+# CONFIGURE BASE AGENT
+# ==========================================================
+
+configure_base_agent() {
+
+    log "Configuring Zabbix agent..."
+
+    if [ ! -f "$CONFIG" ]; then
+        fail "Configuration file not found: $CONFIG"
+    fi
+
+    # Backup configuration
+
+    cp "$CONFIG" \
+        "${CONFIG}.backup.$(date +%Y%m%d%H%M%S)"
+
+    # ------------------------------------------------------
+    # Server
+    # ------------------------------------------------------
+
+    if grep -qE '^[[:space:]]*Server=' "$CONFIG"; then
+
+        sed -i \
+            "s|^[[:space:]]*Server=.*|Server=${ZABBIX_SERVER},${ZABBIX_SERVER_IP}|" \
+            "$CONFIG"
+
+    else
+
+        echo "Server=${ZABBIX_SERVER},${ZABBIX_SERVER_IP}" >> "$CONFIG"
+
+    fi
+
+    # ------------------------------------------------------
+    # ServerActive
+    # ------------------------------------------------------
+
+    if grep -qE '^[[:space:]]*ServerActive=' "$CONFIG"; then
+
+        sed -i \
+            "s|^[[:space:]]*ServerActive=.*|ServerActive=${ZABBIX_SERVER}|" \
+            "$CONFIG"
+
+    else
+
+        echo "ServerActive=${ZABBIX_SERVER}" >> "$CONFIG"
+
+    fi
+
+    # ------------------------------------------------------
+    # Hostname
+    # ------------------------------------------------------
+
+    if grep -qE '^[[:space:]]*Hostname=' "$CONFIG"; then
+
+        sed -i \
+            "s|^[[:space:]]*Hostname=.*|Hostname=${SERVER_IP}|" \
+            "$CONFIG"
+
+    else
+
+        echo "Hostname=${SERVER_IP}" >> "$CONFIG"
+
+    fi
+
+    # ------------------------------------------------------
+    # ListenPort
+    # ------------------------------------------------------
+
+    if grep -qE '^[[:space:]]*ListenPort=' "$CONFIG"; then
+
+        sed -i \
+            "s|^[[:space:]]*ListenPort=.*|ListenPort=${ZABBIX_LISTEN_PORT}|" \
+            "$CONFIG"
+
+    else
+
+        echo "ListenPort=${ZABBIX_LISTEN_PORT}" >> "$CONFIG"
+
+    fi
+
+    # ------------------------------------------------------
+    # Include Directory
+    # ------------------------------------------------------
+
+    mkdir -p /etc/zabbix/zabbix_agentd.d
+
+    if [ "$SERVICE" = "zabbix-agent" ]; then
+
+        if ! grep -qE '^[[:space:]]*Include=/etc/zabbix/zabbix_agentd.d/\*\.conf' "$CONFIG"; then
+
+            echo "Include=/etc/zabbix/zabbix_agentd.d/*.conf" >> "$CONFIG"
+
+        fi
+
+    fi
+
+    log "Zabbix configuration completed."
+
+}
+
+# ==========================================================
+# START / ENABLE AGENT
+# ==========================================================
+
+start_agent() {
+
+    log "Enabling ${SERVICE}..."
+
+    systemctl enable "$SERVICE"
+
+    log "Restarting ${SERVICE}..."
+
+    systemctl restart "$SERVICE"
+
+    sleep 2
+
+    if systemctl is-active --quiet "$SERVICE"; then
+
+        log "SUCCESS: ${SERVICE} is running."
+
+    else
+
+        echo ""
+        echo "======================================================"
+        echo "              SERVICE START FAILED"
+        echo "======================================================"
+
+        systemctl status "$SERVICE" --no-pager -l || true
+
+        echo ""
+        echo "Recent journal:"
+        journalctl -u "$SERVICE" -n 50 --no-pager || true
+
+        exit 1
+
+    fi
+
+}
+
+# ==========================================================
+# INSTALL CRON SERVICE
+# ==========================================================
+
+setup_cron_service() {
+
+    if command -v systemctl >/dev/null 2>&1; then
+
+        case "$OS_ID" in
+
+            rhel|rocky|almalinux|centos|fedora)
+
+                systemctl enable --now crond >/dev/null 2>&1 || true
+
+                ;;
+
+            ubuntu|debian)
+
+                systemctl enable --now cron >/dev/null 2>&1 || true
+
+                ;;
+
+        esac
+
+    fi
+
+}
+
+# ==========================================================
+# ADDITIONAL USER PARAMETERS
+# ==========================================================
+
+install_user_parameters() {
+
+    echo ""
+    echo "======================================================"
+    echo "       ADDITIONAL USER PARAMETERS"
+    echo "======================================================"
+
+    # UserParameters are primarily intended for Classic Agent.
+    # Agent 2 can use the same userparameter directory when
+    # configured appropriately, but this section writes the
+    # Classic Agent configuration path.
+
+    mkdir -p /etc/zabbix/zabbix_agentd.d
+
+    # ------------------------------------------------------
+    # YUM / PACKAGE UPDATE MONITORING
+    # ------------------------------------------------------
+
+    cat > /etc/zabbix/zabbix_agentd.d/userparameter_yum.conf <<'EOF'
+UserParameter=yum1.security,cat /tmp/security-updates.txt 2>/dev/null || echo 0
+UserParameter=yum1.all,cat /tmp/all-updates.txt 2>/dev/null || echo 0
+EOF
+
+    # ------------------------------------------------------
+    # EXIM QUEUE MONITORING
+    # ------------------------------------------------------
+
+    cat > /etc/zabbix/zabbix_agentd.d/userparameter_exim.conf <<'EOF'
+UserParameter=exim.queue,cat /tmp/eximcounttest.txt 2>/dev/null || echo 0
+EOF
+
+    # ------------------------------------------------------
+    # CREATE CACHE FILES
+    # ------------------------------------------------------
+
+    touch /tmp/security-updates.txt
+    touch /tmp/all-updates.txt
+    touch /tmp/eximcounttest.txt
+
+    # ------------------------------------------------------
+    # YUM / APT UPDATE COUNT
+    # ------------------------------------------------------
+
+    if command -v yum >/dev/null 2>&1; then
+
+        yum list updates 2>/dev/null \
+            | grep -E '\.x86_64|\.i686|\.noarch' \
+            | wc -l \
+            > /tmp/all-updates.txt || echo "0" > /tmp/all-updates.txt
+
+    elif command -v dnf >/dev/null 2>&1; then
+
+        dnf list updates 2>/dev/null \
+            | grep -E '\.x86_64|\.i686|\.noarch' \
+            | wc -l \
+            > /tmp/all-updates.txt || echo "0" > /tmp/all-updates.txt
+
+    elif command -v apt-get >/dev/null 2>&1; then
+
+        apt-get -s upgrade 2>/dev/null \
+            | grep -c '^Inst' \
+            > /tmp/all-updates.txt || echo "0" > /tmp/all-updates.txt
+
+    else
+
+        echo "0" > /tmp/all-updates.txt
+
+    fi
+
+    # ------------------------------------------------------
+    # EXIM QUEUE
+    # ------------------------------------------------------
+
+    if [ -x /usr/sbin/exim ]; then
+
+        /usr/sbin/exim -bpc \
+            > /tmp/eximcounttest.txt 2>/dev/null \
+            || echo "0" > /tmp/eximcounttest.txt
+
+    elif command -v exim >/dev/null 2>&1; then
+
+        exim -bpc \
+            > /tmp/eximcounttest.txt 2>/dev/null \
+            || echo "0" > /tmp/eximcounttest.txt
+
+    else
+
+        echo "0" > /tmp/eximcounttest.txt
+
+    fi
+
+    # ------------------------------------------------------
+    # CRON JOBS
+    # ------------------------------------------------------
+
+    setup_cron_service
+
+    CRON_FILE="/etc/cron.d/zabbix-custom"
+
+    cat > "$CRON_FILE" <<'EOF'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+0 1 * * * root yum list updates 2>/dev/null | grep -E '\.x86_64|\.i686|\.noarch' | wc -l > /tmp/all-updates.txt
+
+*/5 * * * * root /usr/sbin/exim -bpc > /tmp/eximcounttest.txt 2>/dev/null || echo 0 > /tmp/eximcounttest.txt
+EOF
+
+    # On Debian/Ubuntu use apt for update count
+
+    if command -v apt-get >/dev/null 2>&1; then
+
+        sed -i \
+            "s|0 1 .*|0 1 * * * root apt-get -s upgrade 2>/dev/null | grep -c '^Inst' > /tmp/all-updates.txt|" \
+            "$CRON_FILE"
+
+    fi
+
+    chmod 644 "$CRON_FILE"
+
+    # ------------------------------------------------------
+    # MYSQL / MARIADB
+    # ------------------------------------------------------
+
+    log "Configuring MySQL/MariaDB monitoring..."
+
+    if command -v mysql >/dev/null 2>&1; then
+
+        ZBX_MYSQL_PASSWORD=$(openssl rand -base64 18 2>/dev/null \
+            | tr -dc 'A-Za-z0-9' \
+            | head -c 16 || true)
+
+        if [ -z "$ZBX_MYSQL_PASSWORD" ]; then
+            ZBX_MYSQL_PASSWORD="$(date +%s)ZbxMonitor"
+        fi
+
+        MYSQL_SUCCESS=0
+
+        # Try socket authentication first
+
+        if mysql -e "SELECT 1;" >/dev/null 2>&1; then
+
+            mysql -e \
+                "CREATE USER IF NOT EXISTS 'zbx_monitor'@'localhost' IDENTIFIED BY '${ZBX_MYSQL_PASSWORD}';" \
+                || true
+
+            mysql -e \
+                "GRANT USAGE,REPLICATION CLIENT,PROCESS,SHOW DATABASES,SHOW VIEW ON *.* TO 'zbx_monitor'@'localhost';" \
+                || true
+
+            mysql -e "FLUSH PRIVILEGES;" || true
+
+            MYSQL_SUCCESS=1
+
+        else
+
+            echo ""
+            echo "======================================================"
+            echo " MySQL root authentication required"
+            echo "======================================================"
+
+            read -rsp "Enter MySQL root password: " MYSQL_ROOT_PASSWORD
+            echo ""
+
+            if mysql \
+                -uroot \
+                -p"${MYSQL_ROOT_PASSWORD}" \
+                -e "SELECT 1;" >/dev/null 2>&1; then
+
+                mysql \
+                    -uroot \
+                    -p"${MYSQL_ROOT_PASSWORD}" \
+                    -e "CREATE USER IF NOT EXISTS 'zbx_monitor'@'localhost' IDENTIFIED BY '${ZBX_MYSQL_PASSWORD}';" \
+                    || true
+
+                mysql \
+                    -uroot \
+                    -p"${MYSQL_ROOT_PASSWORD}" \
+                    -e "GRANT USAGE,REPLICATION CLIENT,PROCESS,SHOW DATABASES,SHOW VIEW ON *.* TO 'zbx_monitor'@'localhost';" \
+                    || true
+
+                mysql \
+                    -uroot \
+                    -p"${MYSQL_ROOT_PASSWORD}" \
+                    -e "FLUSH PRIVILEGES;" \
+                    || true
+
+                MYSQL_SUCCESS=1
+
+            else
+
+                log "WARNING: Unable to authenticate to MySQL as root."
+
+            fi
+
+        fi
+
+        # --------------------------------------------------
+        # MySQL Credentials File
+        # --------------------------------------------------
+
+        if [ "$MYSQL_SUCCESS" -eq 1 ]; then
+
+            cat > /etc/zabbix/.my.cnf <<EOF
+[client]
+user=zbx_monitor
+password=${ZBX_MYSQL_PASSWORD}
+EOF
+
+            chmod 600 /etc/zabbix/.my.cnf
+
+            chown zabbix:zabbix \
+                /etc/zabbix/.my.cnf \
+                2>/dev/null || true
+
+        fi
+
+    else
+
+        log "MySQL/MariaDB client not installed. Skipping MySQL user creation."
+
+        cat > /etc/zabbix/.my.cnf <<'EOF'
+[client]
+user=zbx_monitor
+password=
+EOF
+
+        chmod 600 /etc/zabbix/.my.cnf
+
+        chown zabbix:zabbix \
+            /etc/zabbix/.my.cnf \
+            2>/dev/null || true
+
+    fi
+
+    # ------------------------------------------------------
+    # MYSQL USERPARAMETERS
+    # ------------------------------------------------------
+
+    cat > /etc/zabbix/zabbix_agentd.d/template_db_mysql.conf <<'EOF'
+UserParameter=mysql.ping[*],HOME=/etc/zabbix mysqladmin -h"$1" -P"$2" ping
+UserParameter=mysql.get_status_variables[*],HOME=/etc/zabbix mysql -h"$1" -P"$2" -sNX -e "show global status"
+UserParameter=mysql.version[*],HOME=/etc/zabbix mysqladmin -s -h"$1" -P"$2" version
+UserParameter=mysql.db.discovery[*],HOME=/etc/zabbix mysql -h"$1" -P"$2" -sN -e "show databases"
+UserParameter=mysql.dbsize[*],HOME=/etc/zabbix mysql -h"$1" -P"$2" -sN -e "SELECT SUM(DATA_LENGTH + INDEX_LENGTH) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA='$3'"
+UserParameter=mysql.replication.discovery[*],HOME=/etc/zabbix mysql -h"$1" -P"$2" -sNX -e "show slave status"
+UserParameter=mysql.slave_status[*],HOME=/etc/zabbix mysql -h"$1" -P"$2" -sNX -e "show slave status"
+EOF
+
+    chmod 644 \
+        /etc/zabbix/zabbix_agentd.d/userparameter_yum.conf \
+        /etc/zabbix/zabbix_agentd.d/userparameter_exim.conf \
+        /etc/zabbix/zabbix_agentd.d/template_db_mysql.conf
+
+    # ------------------------------------------------------
+    # RESTART CLASSIC AGENT IF INSTALLED
+    # ------------------------------------------------------
+
+    if systemctl list-unit-files \
+        | grep -q '^zabbix-agent.service'; then
+
+        systemctl restart zabbix-agent
+
+    fi
+
+    log "Additional UserParameters configured successfully."
+
+}
+
+# ==========================================================
+# VERIFY AGENT
+# ==========================================================
+
+verify_agent() {
+
+    echo ""
+    echo "======================================================"
+    echo "              SERVICE STATUS"
+    echo "======================================================"
+
+    if systemctl is-active --quiet "$SERVICE"; then
+
+        echo "SUCCESS: ${SERVICE} is running."
+
+    else
+
+        echo "ERROR: ${SERVICE} is not running."
+        systemctl status "$SERVICE" --no-pager -l || true
+        exit 1
+
+    fi
+
+    echo ""
+    echo "======================================================"
+    echo "              ZABBIX VERSION"
+    echo "======================================================"
+
+    if [ -x "$(command -v "$BINARY" 2>/dev/null)" ]; then
+
+        "$BINARY" -V | head -1
+
+    elif command -v "$BINARY" >/dev/null 2>&1; then
+
+        "$BINARY" -V | head -1
+
+    else
+
+        echo "WARNING: Unable to determine Zabbix binary version."
+
+    fi
+
+    echo ""
+    echo "======================================================"
+    echo "              PORT CHECK"
+    echo "======================================================"
+
+    if ss -lntp 2>/dev/null | grep -q ":${ZABBIX_LISTEN_PORT}"; then
+
+        echo "SUCCESS: Port ${ZABBIX_LISTEN_PORT} is listening."
+
+    else
+
+        echo "WARNING: Port ${ZABBIX_LISTEN_PORT} is not listening."
+
+    fi
+
+    echo ""
+    echo "======================================================"
+    echo "              CONFIGURATION"
+    echo "======================================================"
+
+    echo "Config file: ${CONFIG}"
+    echo ""
+
+    grep -E \
+        '^[[:space:]]*(Server|ServerActive|Hostname|ListenPort)=' \
+        "$CONFIG" \
+        || true
+
+}
+
+# ==========================================================
+# INSTALL COMPLETE ZABBIX AGENT
+# ==========================================================
+
+install_agent() {
+
+    local agent_type="$1"
+
+    echo ""
+    echo "======================================================"
+
+    if [ "$agent_type" = "classic" ]; then
+
+        echo "       ZABBIX AGENT CLASSIC INSTALLATION"
+
+    else
+
+        echo "          ZABBIX AGENT 2 INSTALLATION"
+
+    fi
+
+    echo "======================================================"
+
+    install_common_packages
+    install_zabbix_repo
+    remove_existing_agents
+    install_selected_agent "$agent_type"
+    configure_base_agent
+    start_agent
+    verify_agent
+
+    echo ""
+    echo "======================================================"
+    echo "       ZABBIX INSTALLATION COMPLETED"
+    echo "======================================================"
+
+    if [ "$agent_type" = "classic" ]; then
+
+        echo "Agent       : Zabbix Agent (Classic)"
+        echo "Package     : zabbix-agent"
+        echo "Binary      : zabbix_agentd"
+
+    else
+
+        echo "Agent       : Zabbix Agent 2"
+        echo "Package     : zabbix-agent2"
+        echo "Binary      : zabbix_agent2"
+
+    fi
+
+    echo "Version     : ${ZABBIX_VERSION}"
+    echo "Hostname    : ${SERVER_IP}"
+    echo "Zabbix      : ${ZABBIX_SERVER}"
+    echo "Server IP   : ${ZABBIX_SERVER_IP}"
+    echo "Port        : ${ZABBIX_LISTEN_PORT}"
+    echo "Config      : ${CONFIG}"
+
+    echo ""
+    echo "======================================================"
+
+}
+
+# ==========================================================
+# MAIN MENU
+# ==========================================================
+
+clear
+
+echo "======================================================"
+echo "              ZABBIX ${ZABBIX_VERSION}"
+echo "          AGENT SETUP & MONITORING MENU"
+echo "======================================================"
+echo ""
+echo "Detected OS       : ${NAME:-Unknown}"
+echo "OS Version        : ${OS_VERSION}"
+echo "Detected Server IP: ${SERVER_IP}"
+echo "Zabbix Server     : ${ZABBIX_SERVER}"
+echo "Zabbix Server IP  : ${ZABBIX_SERVER_IP}"
+echo ""
+echo "1) Install Zabbix Agent (Classic)"
+echo "2) Install Zabbix Agent 2"
+echo "3) Configure Additional UserParameters"
+echo "   - Yum / DNF Updates"
+echo "   - Exim Queue"
+echo "   - MySQL / MariaDB"
+echo "4) Exit"
+echo ""
+echo "======================================================"
+
+read -rp "Please enter your choice [1-4]: " CHOICE
+
+case "$CHOICE" in
+
+    1)
+
+        install_agent "classic"
+
+        ;;
+
+    2)
+
+        install_agent "agent2"
+
+        ;;
+
+    3)
+
+        install_user_parameters
+
+        echo ""
+        echo "======================================================"
+        echo "      USERPARAMETERS CONFIGURATION COMPLETED"
+        echo "======================================================"
+        echo ""
+        echo "Configuration directory:"
+        echo "/etc/zabbix/zabbix_agentd.d/"
+        echo ""
+        echo "Files created:"
+        echo "  - userparameter_yum.conf"
+        echo "  - userparameter_exim.conf"
+        echo "  - template_db_mysql.conf"
+        echo ""
+        echo "======================================================"
+
+        ;;
+
+    4)
+
+        echo ""
+        echo "Exiting script."
+        exit 0
+
+        ;;
+
+    *)
+
+        fail "Invalid selection. Please select 1, 2, 3, or 4."
+
+        ;;
+
+esac
